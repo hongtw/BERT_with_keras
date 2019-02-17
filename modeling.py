@@ -137,10 +137,11 @@ class LayerNormalization(Layer):
     def build(self, input_shape):
         self.scale = self.add_weight(shape=(input_shape[-1],),
                                     initializer=initializers.get('ones'),
-                                    name='layer_norm')
+                                     name='gamma')
+#                                     name='layer_norm')
         self.bias = self.add_weight(shape=(input_shape[-1],),
                                     initializer=initializers.get('zeros'),
-                                    name='bias')
+                                    name='beta')
         super(LayerNormalization, self).build(input_shape)
 
     def call(self, x, epsilon=1e-6):
@@ -276,7 +277,7 @@ class MultiHeadAttentionLayer(Layer):
         self.attention_probs_dropout_prob = attention_probs_dropout_prob
         self.initializer_range = initializer_range
         self.supports_masking = True
-
+    
 
     def build(self, input_shape):
         assert  len(input_shape) == 2
@@ -450,7 +451,8 @@ class BertModel(object):
                  max_predictions_per_seq=20,
                  use_token_type=False,
                  embeddings_matrix=None,
-                 mask=False):
+                 mask=False,
+                 ckpt=None):
         """ Constructor for BertModel
 
         Args:
@@ -485,7 +487,8 @@ class BertModel(object):
                 weights=[embeddings_matrix],
                 mask=mask,
                 input_length=seq_length,
-                trainable=True
+                trainable=True,
+                name='embeddings/word_embeddings',
             )
         else:
             embeddings_layer = EmbeddingLookup(
@@ -495,6 +498,7 @@ class BertModel(object):
                 input_length=seq_length,
                 trainable=True,
                 embeddings_initializer=initializers.TruncatedNormal(stddev=config.initializer_range),
+                name='embeddings/word_embeddings'
             )
         self.embedding_output, self.embedding_table = embeddings_layer([input_ids, input_mask])
 
@@ -515,7 +519,8 @@ class BertModel(object):
                 token_type_vocab_size=config.type_vocab_size,
                 use_position_embeddings=True,
                 initializer_range=config.initializer_range,
-                max_position_embeddings=config.max_position_embeddings
+                max_position_embeddings=config.max_position_embeddings,
+                name='embeddings'
             )([self.embedding_output, input_token_type_ids])
         else:
             self.embedding_output = Embedding_Postprocessor(
@@ -524,9 +529,10 @@ class BertModel(object):
                 use_position_embeddings=True,
                 initializer_range=config.initializer_range,
                 max_position_embeddings=config.max_position_embeddings,
+                name='embeddings'
             )(self.embedding_output)
 
-        self.embedding_output = LayerNormalization()(self.embedding_output)
+        self.embedding_output = LayerNormalization(name='embedding/LayerNorm')(self.embedding_output)
         self.embedding_output = Dropout(config.hidden_dropout_prob)(self.embedding_output)
 
         # Run the stacked transformer.
@@ -541,29 +547,33 @@ class BertModel(object):
                 num_attention_heads=config.num_attention_heads,
                 size_per_head=attention_head_size,
                 attention_probs_dropout_prob=config.attention_dropout_prob,
-                initializer_range=config.initializer_range
+                initializer_range=config.initializer_range,
+                name=f'layer_{layer_idx}/attention'
             )([layer_input, layer_input])
             attention_ouput = Dense(
                 units=config.hidden_size,
-                kernel_initializer=initializers.TruncatedNormal(stddev=config.initializer_range)
+                kernel_initializer=initializers.TruncatedNormal(stddev=config.initializer_range),
+                name=f'layer_{layer_idx}/attention/output/dense'
             )(attention_ouput)
             attention_ouput = Dropout(config.hidden_dropout_prob)(attention_ouput)
             attention_ouput = TensorAdd()([layer_input, attention_ouput])
-            attention_ouput = LayerNormalization()(attention_ouput)
+            attention_ouput = LayerNormalization(name=f'layer_{layer_idx}/attention/LayerNorm')(attention_ouput)
 
             # FFN
             intermediate_ouput = Dense(
                 units=config.intermediate_size,
                 activation=get_activation(config.hidden_act),
                 kernel_initializer=initializers.TruncatedNormal(stddev=config.initializer_range),
+                name=f'layer_{layer_idx}/intermediate'
             )(attention_ouput)
             layer_output = Dense(
                 units=config.hidden_size,
-                kernel_initializer=initializers.TruncatedNormal(stddev=config.initializer_range)
+                kernel_initializer=initializers.TruncatedNormal(stddev=config.initializer_range),
+                name=f'layer_{layer_idx}/output/dense'
             )(intermediate_ouput)
             layer_output = Dropout(config.hidden_dropout_prob)(layer_output)
             layer_output = TensorAdd()([attention_ouput, layer_output])
-            layer_output = LayerNormalization()(layer_output)
+            layer_output = LayerNormalization(name=f'layer_{layer_idx}/output/LayerNorm')(layer_output)
             prev_output = layer_output
             all_layer_outputs.append(layer_output)
 
@@ -581,11 +591,65 @@ class BertModel(object):
         self.pooled_output = Dense(
             units=config.hidden_size,
             activation='tanh',
-            kernel_initializer=initializers.TruncatedNormal(stddev=config.initializer_range)
+            kernel_initializer=initializers.TruncatedNormal(stddev=config.initializer_range),
+            name='pooler/dense'
         )(first_token_tensor)
         # construct text encoder model
         self.bert_model = Model(inputs=self.inputs, outputs=self.pooled_output, name='bert_model')
-
+        
+        self._load_google_bert(ckpt)
+       
+    def _load_google_bert(self, ckpt):
+        if ckpt:
+            check_point = tf.train.load_checkpoint(ckpt)
+            model = self.bert_model
+            model.get_layer(name='embeddings/word_embeddings').set_weights([
+                    check_point.get_tensor('bert/embeddings/word_embeddings')
+                ])
+            model.get_layer(name='embeddings').set_weights([
+                    check_point.get_tensor('bert/embeddings/token_type_embeddings'),
+                    check_point.get_tensor('bert/embeddings/position_embeddings')
+                ])
+            model.get_layer(name='embedding/LayerNorm').set_weights([
+                    check_point.get_tensor('bert/embeddings/LayerNorm/gamma'),
+                    check_point.get_tensor('bert/embeddings/LayerNorm/beta')
+                ])
+            model.get_layer(name='pooler/dense').set_weights([
+                    check_point.get_tensor('bert/pooler/dense/kernel'),
+                    check_point.get_tensor('bert/pooler/dense/bias')
+                ])
+            
+            for i in range(config.num_hidden_layers):
+                model.get_layer(name=f'layer_{i}/attention').set_weights([
+                    check_point.get_tensor('bert/encoder/layer_%d/attention/self/query/kernel' % i),
+                    check_point.get_tensor('bert/encoder/layer_%d/attention/self/query/bias' % i),
+                    check_point.get_tensor('bert/encoder/layer_%d/attention/self/key/kernel' % i),
+                    check_point.get_tensor('bert/encoder/layer_%d/attention/self/key/bias' % i),
+                    check_point.get_tensor('bert/encoder/layer_%d/attention/self/value/kernel' % i),
+                    check_point.get_tensor('bert/encoder/layer_%d/attention/self/value/bias' % i),
+                    
+                ])
+                model.get_layer(name=f'layer_{i}/attention/output/dense').set_weights([
+                    check_point.get_tensor('bert/encoder/layer_%d/attention/output/dense/kernel' % i),
+                    check_point.get_tensor('bert/encoder/layer_%d/attention/output/dense/bias' % i),
+                ])
+                model.get_layer(name=f'layer_{i}/attention/LayerNorm').set_weights([
+                    check_point.get_tensor('bert/encoder/layer_%d/attention/output/LayerNorm/gamma' % i),
+                    check_point.get_tensor('bert/encoder/layer_%d/attention/output/LayerNorm/beta' % i),
+                ])
+                model.get_layer(name=f'layer_{i}/intermediate').set_weights([
+                    check_point.get_tensor('bert/encoder/layer_%d/intermediate/dense/kernel' % i),
+                    check_point.get_tensor('bert/encoder/layer_%d/intermediate/dense/bias' % i),
+                ])
+                model.get_layer(name=f'layer_{i}/output/dense').set_weights([
+                    check_point.get_tensor('bert/encoder/layer_%d/output/dense/kernel' % i),
+                    check_point.get_tensor('bert/encoder/layer_%d/output/dense/bias' % i),
+                ])
+                model.get_layer(name=f'layer_{i}/output/LayerNorm').set_weights([
+                    check_point.get_tensor('bert/encoder/layer_%d/output/LayerNorm/gamma' % i),
+                    check_point.get_tensor('bert/encoder/layer_%d/output/LayerNorm/beta' % i),
+                ])
+    
     def get_pooled_output(self):
         return self.pooled_output
 
@@ -631,7 +695,7 @@ class BertModel(object):
             activation=get_activation(config.hidden_act),
             kernel_initializer=initializers.truncated_normal(stddev=config.initializer_range),
         )(sequence_output)
-        sequence_output = LayerNormalization()(sequence_output)
+        sequence_output = LayerNormalization(name='sequence/LayerNorm')(sequence_output)
 
         sequence_att = Lambda(
             function=lambda x: K.dot(x[0], K.permute_dimensions(x[1], pattern=(1,0))),
@@ -694,7 +758,7 @@ class BertModel(object):
         self.classifer_model = Model(inputs=self.inputs, outputs=pred)
         return self.classifer_model
 
-
+    
 def gather_indexes(sequence_tensor, positions):
     """Gathers the vectors at the specific positions over a minibatch.
     sequence_tensor shape: [batch_size, seq_length, width]
