@@ -39,6 +39,7 @@ class EmbeddingLookup(Embedding):
             embeddings_constraint=embeddings_constraint,
             mask_zero=False,
             input_length=input_length,
+            name='embeddings/word_embeddings',
             **kwargs
         )
 
@@ -451,7 +452,7 @@ class BertModel(object):
                  max_predictions_per_seq=20,
                  use_token_type=False,
                  embeddings_matrix=None,
-                 mask=False,
+                 mask=True,
                  ckpt=None):
         """ Constructor for BertModel
 
@@ -488,7 +489,6 @@ class BertModel(object):
                 mask=mask,
                 input_length=seq_length,
                 trainable=True,
-                name='embeddings/word_embeddings',
             )
         else:
             embeddings_layer = EmbeddingLookup(
@@ -498,7 +498,6 @@ class BertModel(object):
                 input_length=seq_length,
                 trainable=True,
                 embeddings_initializer=initializers.TruncatedNormal(stddev=config.initializer_range),
-                name='embeddings/word_embeddings'
             )
         self.embedding_output, self.embedding_table = embeddings_layer([input_ids, input_mask])
 
